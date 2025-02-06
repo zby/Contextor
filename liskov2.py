@@ -13,8 +13,12 @@ class InheritanceGraph:
         self.direct_parents = {}
         # Maps class names to their source code
         self.class_source = {}
+        # Add a new dictionary to store module paths for each class
+        self.class_modules = {}
+        # Add a dictionary to store full module content
+        self.module_contents = {}
 
-    def add_class(self, class_name: str, parent_names: list[str], source_code: str) -> None:
+    def add_class(self, class_name: str, parent_names: list[str], source_code: str, module_path: str, module_content: str) -> None:
         """
         Add a class and its direct parent classes to the graph.
         
@@ -22,9 +26,13 @@ class InheritanceGraph:
             class_name: Name of the class being added
             parent_names: List of direct parent class names
             source_code: Raw source code of the class
+            module_path: Path to the module containing the class
+            module_content: Full content of the module
         """
         self.direct_parents[class_name] = set(parent_names)
         self.class_source[class_name] = source_code
+        self.class_modules[class_name] = module_path
+        self.module_contents[module_path] = module_content
 
     def is_subclass(self, potential_child: str, potential_parent: str) -> bool:
         """
@@ -55,6 +63,8 @@ class ClassInfoExtractor(ast.NodeVisitor):
     def __init__(self):
         super().__init__()
         self.inheritance_graph = InheritanceGraph()
+        self.current_module_content = ""
+        self.current_module_path = ""
 
     def visit_ClassDef(self, node: ast.ClassDef):
         """Extract class name, bases, and source code."""
@@ -72,7 +82,13 @@ class ClassInfoExtractor(ast.NodeVisitor):
         
         # Add to inheritance graph
         full_class_name = self._get_full_class_name(node)
-        self.inheritance_graph.add_class(full_class_name, base_names, source_code)
+        self.inheritance_graph.add_class(
+            full_class_name, 
+            base_names, 
+            source_code,
+            self.current_module_path,
+            self.current_module_content
+        )
 
         self.generic_visit(node)
 
@@ -100,6 +116,9 @@ def process_file(file_path: str, extractor: ClassInfoExtractor) -> None:
         with open(file_path, "r", encoding="utf-8") as f:
             source = f.read()
         tree = ast.parse(source, file_path)
+        # Store the full module content in the extractor
+        extractor.current_module_content = source
+        extractor.current_module_path = file_path
         extractor.visit(tree)
     except Exception as e:
         print(f"Error processing {file_path}: {str(e)}")
@@ -117,17 +136,89 @@ def process_codebase(root_dir: str, extractor: ClassInfoExtractor) -> Inheritanc
     return extractor.inheritance_graph
 
 def write_class_pairs(inheritance_graph: InheritanceGraph, output_dir: str) -> None:
-    """Write subclass-superclass pairs to a JSON file."""
-    # make sure the output directory exists
+    """Write subclass-superclass pairs to files with complete module contents."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
+
+    def get_classes_in_module(module_path: str, as_super: bool, pairs: list[tuple[str, str]]) -> list[str]:
+        """Get classes defined in a module, filtered by their role in the inheritance pairs."""
+        classes = set()
+        for superclass, subclass in pairs:
+            if inheritance_graph.class_modules[superclass] == module_path and as_super:
+                classes.add(superclass)
+            elif inheritance_graph.class_modules[subclass] == module_path and not as_super:
+                classes.add(subclass)
+        return sorted(classes)
+
+    def get_other_classes_in_module(module_path: str, pairs: list[tuple[str, str]]) -> list[str]:
+        """Get classes defined in a module that aren't involved in these inheritance relationships."""
+        involved_classes = set()
+        for superclass, subclass in pairs:
+            involved_classes.add(superclass)
+            involved_classes.add(subclass)
+        
+        return sorted([
+            class_name for class_name, path in inheritance_graph.class_modules.items()
+            if path == module_path and class_name not in involved_classes
+        ])
+
+    # Group pairs by their module combinations
+    module_groups = {}
     for pair in inheritance_graph.get_all_pairs():
-        output_path = os.path.join(output_dir, f"{pair[0]}.{pair[1]}.txt")
+        superclass, subclass = pair
+        super_module = inheritance_graph.class_modules[superclass]
+        sub_module = inheritance_graph.class_modules[subclass]
+        
+        module_key = (super_module, sub_module)
+        if module_key not in module_groups:
+            module_groups[module_key] = []
+        module_groups[module_key].append((superclass, subclass))
+    
+    # Write one file per unique module combination
+    for (super_module, sub_module), pairs in module_groups.items():
+        first_pair = pairs[0]
+        output_path = os.path.join(output_dir, f"{first_pair[0]}.{first_pair[1]}.txt")
+        
         with open(output_path, 'w', encoding='utf-8') as f:
-            superclass = inheritance_graph.class_source[pair[0]]
-            subclass = inheritance_graph.class_source[pair[1]]
-            f.write(f"Superclass source code:\n{superclass}\n\n")
-            f.write(f"Subclass source code:\n{subclass}\n\n")
+            # Write header with inheritance relationships
+            f.write("# Inheritance relationships in this file:\n")
+            for superclass, subclass in pairs:
+                f.write(f"# - {superclass} -> {subclass}\n")
+            f.write("\n")
+            
+            # List classes in first module
+            f.write(f"# Classes in {super_module}:\n")
+            f.write("# Superclasses:\n")
+            for class_name in get_classes_in_module(super_module, True, pairs):
+                f.write(f"# - {class_name}\n")
+            if super_module == sub_module:
+                f.write("# Subclasses:\n")
+                for class_name in get_classes_in_module(super_module, False, pairs):
+                    f.write(f"# - {class_name}\n")
+            f.write("# Other classes:\n")
+            for class_name in get_other_classes_in_module(super_module, pairs):
+                f.write(f"# - {class_name}\n")
+            f.write("\n")
+            
+            if super_module != sub_module:
+                f.write(f"# Classes in {sub_module}:\n")
+                f.write("# Subclasses:\n")
+                for class_name in get_classes_in_module(sub_module, False, pairs):
+                    f.write(f"# - {class_name}\n")
+                f.write("# Other classes:\n")
+                for class_name in get_other_classes_in_module(sub_module, pairs):
+                    f.write(f"# - {class_name}\n")
+                f.write("\n")
+            
+            # Write module contents
+            f.write(f"# Full contents of {super_module}:\n")
+            f.write(inheritance_graph.module_contents[super_module])
+            
+            f.write("\n\n" + "="*80 + "\n\n")
+            
+            if super_module != sub_module:
+                f.write(f"# Full contents of {sub_module}:\n")
+                f.write(inheritance_graph.module_contents[sub_module])
 
 if __name__ == "__main__":
     path = "/home/zby/llm/pydantic-ai/pydantic_ai_slim/"
